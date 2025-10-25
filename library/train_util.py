@@ -3935,6 +3935,26 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         choices=["no", "fp16", "bf16"],
         help="use mixed precision / 混合精度を使う場合、その精度",
     )
+    parser.add_argument(
+        "--flow_matching",
+        action="store_true",
+        help="use flow matching objective instead of diffusion noise prediction / flow matching目的を使用する",
+    )
+    parser.add_argument(
+        "--flow_matching_objective",
+        type=str,
+        default="vector_field",
+        choices=["vector_field", "latent", "noise"],
+        help="target type for flow matching training (vector_field=noise-data, latent=data, noise=noise)"
+        " / flow matching学習時のターゲットの種類（vector_field=ノイズとデータの差、latent=データ、noise=ノイズ)",
+    )
+    parser.add_argument(
+        "--flow_matching_shift",
+        type=float,
+        default=1.0,
+        help="shift parameter for flow matching timestep sampling (1.0 for uniform)"
+        " / flow matchingのタイムステップサンプリング用シフト値（1.0で一様分布)",
+    )
     parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
     parser.add_argument(
         "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
@@ -4496,6 +4516,26 @@ def verify_training_args(args: argparse.Namespace):
             f"zero_terminal_snr is enabled, but v_parameterization is not enabled. training will be unexpected"
             + " / zero_terminal_snrが有効ですが、v_parameterizationが有効ではありません。学習結果は想定外になる可能性があります"
         )
+
+    if args.flow_matching:
+        if args.flow_matching_shift <= 0:
+            raise ValueError("flow_matching_shift must be greater than 0 / flow_matching_shiftは0より大きい必要があります")
+        if args.v_parameterization:
+            raise ValueError("flow matching cannot be combined with v_parameterization / flow matchingはv_parameterizationと併用できません")
+        disallowed_options = [
+            ("min_snr_gamma", args.min_snr_gamma),
+            ("scale_v_pred_loss_like_noise_pred", args.scale_v_pred_loss_like_noise_pred),
+            ("v_pred_like_loss", args.v_pred_like_loss),
+            ("debiased_estimation_loss", args.debiased_estimation_loss),
+            ("sangoi_loss_modifier", args.sangoi_loss_modifier),
+            ("edm2_loss_weighting", args.edm2_loss_weighting),
+            ("zero_terminal_snr", args.zero_terminal_snr),
+        ]
+        for option_name, enabled in disallowed_options:
+            if enabled:
+                raise ValueError(
+                    f"{option_name} cannot be enabled with flow matching / {option_name}はflow matchingと併用できません"
+                )
 
     if args.sample_every_n_epochs is not None and args.sample_every_n_epochs <= 0:
         logger.warning(
