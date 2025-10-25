@@ -415,37 +415,92 @@ class NetworkTrainer:
             # Convert to float64, noise and noisy latents will be float64 due to using like on latents
             latents = latents.to(torch.float64)
 
-        # Sample noise, sample a random timestep for each image, and add noise to the latents,
-        # with noise offset and/or multires noise if specified
-        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, fixed_timesteps, train, batch, min_timestep_override, max_timestep_override)
+        if getattr(args, "flow_matching", False):
+            noise = torch.randn_like(latents)
+            device = latents.device
+            batch_size = latents.shape[0]
+            fm_dtype = torch.float64 if args.loss_related_use_float64 else torch.float32
 
-        # ensure the hidden state will require grad
-        if train and args.gradient_checkpointing:
-            for x in noisy_latents:
-                x.requires_grad_(True)
-            for t in text_encoder_conds:
-                t.requires_grad_(True)
+            u = torch.rand(batch_size, device=device, dtype=fm_dtype)
+            shift = getattr(args, "flow_matching_shift", 1.0)
+            if shift != 1.0:
+                u = (u * shift) / (1 + (shift - 1) * u)
 
-        # Predict the noise residual
-        noise_pred = self.call_unet(
-            args,
-            accelerator,
-            unet,
-            noisy_latents.requires_grad_(train and train_unet),
-            timesteps,
-            text_encoder_conds,
-            batch,
-            weight_dtype,
-        )
+            t_min = args.min_timestep if args.min_timestep is not None else 0.0
+            t_max = args.max_timestep if args.max_timestep is not None else 1000.0
+            timesteps = u * (t_max - t_min) + t_min
+            timesteps = timesteps.to(device=device, dtype=fm_dtype)
 
-        if args.loss_related_use_float64:
-            noise_pred = noise_pred.to(torch.float64)
+            sigmas = timesteps / 1000.0
+            while sigmas.ndim < latents.ndim:
+                sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
 
-        if args.v_parameterization:
-            # v-parameterization training
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            noisy_latents = sigmas * noise + (1.0 - sigmas) * latents
+
+            if train and args.gradient_checkpointing:
+                for t in text_encoder_conds:
+                    if t is not None and t.dtype.is_floating_point:
+                        t.requires_grad_(True)
+
+            noise_pred = self.call_unet(
+                args,
+                accelerator,
+                unet,
+                noisy_latents.requires_grad_(train and train_unet),
+                timesteps,
+                text_encoder_conds,
+                batch,
+                weight_dtype,
+            )
+
+            if args.loss_related_use_float64:
+                noise_pred = noise_pred.to(torch.float64)
+
+            objective = getattr(args, "flow_matching_objective", "vector_field")
+            if objective == "latent":
+                target = latents.clone()
+            elif objective == "noise":
+                target = noise.clone()
+            else:
+                target = noise - latents
+
+            weighting = None
         else:
-            target = noise
+            # Sample noise, sample a random timestep for each image, and add noise to the latents,
+            # with noise offset and/or multires noise if specified
+            noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                args, noise_scheduler, latents, fixed_timesteps, train, batch, min_timestep_override, max_timestep_override
+            )
+
+            # ensure the hidden state will require grad
+            if train and args.gradient_checkpointing:
+                for x in noisy_latents:
+                    x.requires_grad_(True)
+                for t in text_encoder_conds:
+                    t.requires_grad_(True)
+
+            # Predict the noise residual
+            noise_pred = self.call_unet(
+                args,
+                accelerator,
+                unet,
+                noisy_latents.requires_grad_(train and train_unet),
+                timesteps,
+                text_encoder_conds,
+                batch,
+                weight_dtype,
+            )
+
+            if args.loss_related_use_float64:
+                noise_pred = noise_pred.to(torch.float64)
+
+            if args.v_parameterization:
+                # v-parameterization training
+                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                target = noise
+
+            weighting = None
 
         if args.loss_related_use_float64:
             target = target.to(torch.float64)
@@ -474,7 +529,7 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-            return noise_pred, target, timesteps, None, noisy_latents
+            return noise_pred, target, timesteps, weighting, noisy_latents
     
     def determine_grad_sync_context(self, accelerator, sync_gradients, training_model, lossweightMLP = None):
         if not sync_gradients and accelerator.num_processes > 1:
@@ -486,6 +541,8 @@ class NetworkTrainer:
             return contextlib.nullcontext()
         
     def post_process_loss(self, loss, args, timesteps, noise_scheduler, train=True):
+        if getattr(args, "flow_matching", False):
+            return loss
         if args.min_snr_gamma and train and not args.sangoi_loss_modifier:
             loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
         if args.scale_v_pred_loss_like_noise_pred and train:

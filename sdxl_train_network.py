@@ -7,7 +7,15 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl, train_util
+from library import (
+    sd3_train_utils,
+    sdxl_model_util,
+    sdxl_train_util,
+    strategy_base,
+    strategy_sd,
+    strategy_sdxl,
+    train_util,
+)
 import train_network
 from library.utils import setup_logging
 from tools.stochastic_copy import to_stochastic
@@ -38,6 +46,9 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         ), "network for Text Encoder cannot be trained with caching Text Encoder outputs / Text Encoderの出力をキャッシュしながらText Encoderのネットワークを学習することはできません"
 
         train_dataset_group.verify_bucket_reso_steps(32)
+
+        if getattr(args, "flow_matching", False):
+            logger.info("Flow matching objective enabled for SDXL LoRA training / SDXL LoRA学習でflow matching目的が有効です")
 
     def load_target_model(self, args, weight_dtype, accelerator):
         (
@@ -205,6 +216,21 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def get_text_encoders_train_flags(self, args, text_encoders):
         return [True, True]
+
+    def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device):
+        if getattr(args, "flow_matching", False):
+            return sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.flow_matching_shift)
+        return super().get_noise_scheduler(args, device)
+
+    def update_metadata(self, metadata, args):
+        metadata["ss_flow_matching"] = bool(getattr(args, "flow_matching", False))
+        if getattr(args, "flow_matching", False):
+            metadata["ss_flow_matching_objective"] = args.flow_matching_objective
+            metadata["ss_flow_matching_shift"] = args.flow_matching_shift
+            if args.min_timestep is not None:
+                metadata["ss_flow_matching_min_timestep"] = args.min_timestep
+            if args.max_timestep is not None:
+                metadata["ss_flow_matching_max_timestep"] = args.max_timestep
 
 
 def setup_parser() -> argparse.ArgumentParser:
